@@ -1,0 +1,150 @@
+Transform: 'AWS::Serverless-2016-10-31'
+
+Globals:
+    Function:
+        Runtime: nodejs18.x
+        Timeout: 5
+        MemorySize: 512
+        Layers:
+            - !Ref ImageLayer
+        Architectures:
+            - x86_64
+        CodeUri: ./src
+        Environment:
+            Variables:
+                BUCKET: !Sub '${AWS::StackName}-images-bucket'
+
+Resources:
+    # Bucket definition for images
+    ImageBucket:
+        Type: AWS::S3::Bucket
+        Properties:
+            BucketName: !Sub ${AWS::StackName}-images-bucket
+            OwnershipControls:
+                Rules:
+                    - ObjectOwnership: BucketOwnerPreferred
+
+    # Lambda Layer with dependencies (e.g., sharp)
+    ImageLayer:
+        Type: AWS::Serverless::LayerVersion
+        Properties:
+            LayerName: sharp-dependencies
+            Description: Dependencies for sam app 
+            ContentUri: ./layers/jimp
+            CompatibleRuntimes:
+              - nodejs18.x
+            LicenseInfo: 'MIT'
+            RetentionPolicy: Retain
+        Metadata:
+            BuildMethod: nodejs18.x
+
+    # Lambda for image processing triggered by S3 event
+    ImageResizeFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            Handler: imageResize.handler
+            Timeout: 7
+            Policies:
+                - S3ReadPolicy:
+                      BucketName: !Sub '${AWS::StackName}-images-bucket'
+                - S3WritePolicy:
+                      BucketName: !Sub '${AWS::StackName}-images-bucket'
+                - Statement:
+                      Effect: Allow
+                      Action:
+                          - 'lambda:InvokeFunction'
+                      Resource: '*'
+            Environment:
+                Variables:
+                    BUCKET: !Sub '${AWS::StackName}-images-bucket'
+            Events:
+                ImageUpload:
+                    Type: S3
+                    Properties:
+                        Bucket: !Ref ImageBucket
+                        Events: s3:ObjectCreated:*
+                        Filter:
+                            S3Key:
+                                Rules:
+                                    - Name: suffix
+                                      Value: '.jpg'
+
+        Metadata:
+            BuildMethod: esbuild
+            BuildProperties:
+                Outdir: .
+                Platform: node
+                Minify: true
+                Target: 'es2020'
+                Sourcemap: true
+                External:
+                    - sharp
+
+    # Lambda for generating signed URLs triggered by API Gateway
+    ImageUrlFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            Handler: imageUrl.handler
+            Policies:
+                - S3ReadPolicy:
+                      BucketName: !Sub '${AWS::StackName}-images-bucket'
+                - Statement:
+                      Effect: Allow
+                      Action:
+                          - lambda:InvokeFunction
+                      Resource: '*'
+            Environment:
+                Variables:
+                    BUCKET: !Sub '${AWS::StackName}-images-bucket'
+            Events:
+                ImageUrlRequest:
+                    Type: Api
+                    Properties:
+                        RestApiId: !Ref ApiGatewayRestApi
+                        Path: /images/{id}
+                        Method: get
+
+        Metadata:
+            BuildMethod: esbuild
+            BuildProperties:
+                Outdir: .
+                Platform: node
+                Minify: true
+                Target: 'es2020'
+                Sourcemap: true
+
+    # API Gateway definition so that we can trigger the lambda function by request
+    ApiGatewayRestApi:
+        Type: AWS::ApiGateway::RestApi
+        Properties:
+            Name: ImageApi
+
+    # API Gateway Resource for /images/{id} path
+    ApiGatewayResourceImages:
+        Type: AWS::ApiGateway::Resource
+        Properties:
+            ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+            RestApiId: !Ref ApiGatewayRestApi
+            PathPart: images
+
+    ApiGatewayResourceImageId:
+        Type: AWS::ApiGateway::Resource
+        Properties:
+            ParentId: !Ref ApiGatewayResourceImages
+            RestApiId: !Ref ApiGatewayRestApi
+            PathPart: '{id}'
+
+    # API Gateway Method for GET /images/{id}
+    ApiGatewayMethodImageUrlGet:
+        Type: AWS::ApiGateway::Method
+        Properties:
+            AuthorizationType: NONE
+            HttpMethod: GET
+            ResourceId: !Ref ApiGatewayResourceImageId
+            RestApiId: !Ref ApiGatewayRestApi
+            Integration:
+                IntegrationHttpMethod: POST
+                Type: AWS_PROXY
+                Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ImageUrlFunction.Arn}/invocations
+            MethodResponses:
+                - StatusCode: 200
